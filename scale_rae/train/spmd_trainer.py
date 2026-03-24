@@ -1,13 +1,13 @@
 """
 Scale-RAE Trainer (GPU 버전, Object-Centric 확장 포함)
 
-TPU/XLA 코드 제거, GPU (CUDA) + torchrun 환경 전용.
-
-주요 변경사항:
-  - LazySupervisedDataset._getitem_: n_objects (COCO GT object 수) 추출
-  - DataCollatorForSupervisedDataset.__call__: n_objects collate
-  - ScaleRAETrainer: OC 손실 로깅 추가
-  - ModelArguments: use_object_centric, oc_max_slots 필드 추가
+변경사항 (이슈 2, 3 수정 + COCO-only 데이터 파이프라인):
+  - Text 없음: conversations 필드 무시, 이미지만 사용
+  - n_objects: instances_train2017.json에서 image_id별 annotation 수 카운트
+  - gt_image_features: DataCollator에서 raw image tensor를 배치에 포함
+    → model.forward에서 vision tower로 encode해서 사용
+  - 이슈 3 (시퀀스 길이): OC slot 추가 전 text 부분 clip 로직은 scale_rae_arch.py에서 처리
+  - DataCollatorForSupervisedDataset: raw_images 필드 추가
 """
 
 import os
@@ -102,6 +102,11 @@ class ModelArguments:
         default=10,
         metadata={"help": "최대 slot 개수 (EOS 슬롯 포함)"},
     )
+    # ─── COCO annotation 경로 ─────────────────────────────────────
+    coco_annotation_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "instances_train2017.json 경로 (n_objects 추출용)"},
+    )
 
 
 @dataclass
@@ -119,6 +124,8 @@ class DataArguments:
     video_max_frames:      int             = 1
     video_force_sample:    bool            = False
     add_time_instruction:  bool            = False
+    # ─── COCO annotation 경로 ─────────────────────────────────────
+    coco_annotation_path:  Optional[str]   = field(default=None)
 
 
 @dataclass
@@ -143,169 +150,115 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset
+# COCO Annotation 로더
 # ─────────────────────────────────────────────────────────────────────────────
 
-def preprocess_qwen(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
-    max_len: int = 2048,
-    system_message: str = "You are a helpful assistant.",
-) -> Dict:
-    """Qwen2 chat template 기반 전처리."""
-    roles     = {"human": "user", "gpt": "assistant"}
-    tokenizer = copy.deepcopy(tokenizer)
-
-    special_tokens = tokenizer.additional_special_tokens_ids
-    im_start, im_end = special_tokens[0], special_tokens[1]
-
-    if has_image:
-        tokenizer.add_tokens(["<image>"], special_tokens=True)
-
-    image_token_index = tokenizer.convert_tokens_to_ids("<image>")
-    unmask_tokens_idx = [198, im_start, im_end]
-
-    chat_template = (
-        "{% for message in messages %}"
-        "{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
-    )
-    tokenizer.chat_template = chat_template
-
-    input_ids, targets = [], []
-
-    for i, source in enumerate(sources):
-        if roles[source[0]["from"]] != roles["human"]:
-            source = source[1:]
-
-        input_id, target = [], []
-        input_id += tokenizer.apply_chat_template([{"role": "system", "content": system_message}])
-        target   += [IGNORE_INDEX] * len(input_id)
-
-        for conv in source:
-            role    = roles.get(conv.get("role", conv.get("from")), "user")
-            content = conv.get("content", conv.get("value", ""))
-            encoded = tokenizer.apply_chat_template([{"role": role, "content": content}])
-            input_id += encoded
-            target   += encoded if role == "assistant" else [IGNORE_INDEX] * len(encoded)
-
-        for idx, eid in enumerate(input_id):
-            if eid in unmask_tokens_idx:
-                target[idx] = eid
-            if eid == image_token_index:
-                input_id[idx] = IMAGE_TOKEN_INDEX
-
-        input_ids.append(input_id)
-        targets.append(target)
-
-    input_ids = torch.tensor(input_ids, dtype=torch.long)
-    targets   = torch.tensor(targets,   dtype=torch.long)
-    return dict(input_ids=input_ids, labels=targets)
-
-
-def preprocess(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
-) -> Dict:
-    if conversation_lib.default_conversation.version == "qwen":
-        return preprocess_qwen(sources, tokenizer, has_image=has_image)
-    # fallback
-    from scale_rae.mm_utils import tokenizer_image_token
-    conversations = []
-    conv          = conversation_lib.default_conversation.copy()
-    roles         = {"human": conv.roles[0], "gpt": conv.roles[1]}
-    for source in sources:
-        conv.messages = []
-        for j, sentence in enumerate(source):
-            role = roles[sentence["from"]]
-            conv.append_message(role, sentence["value"])
-        conversations.append(conv.get_prompt())
-
-    if has_image:
-        input_ids = torch.stack(
-            [tokenizer_image_token(p, tokenizer, return_tensors='pt') for p in conversations], dim=0
-        )
-    else:
-        input_ids = tokenizer(
-            conversations,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        ).input_ids
-
-    targets = input_ids.clone()
-    return dict(input_ids=input_ids, labels=targets)
-
-
-def preprocess_multimodal(sources, data_args):
-    if not data_args.is_multimodal:
-        return sources
-    for source in sources:
-        for sentence in source:
-            replace_token = DEFAULT_IMAGE_TOKEN
-            if data_args.mm_use_im_start_end:
-                replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
-            sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
-    return sources
-
-
-class LazySupervisedDataset(Dataset):
+def load_coco_n_objects(annotation_path: str) -> Dict[str, int]:
     """
-    지연 로딩 supervised dataset.
+    instances_train2017.json에서 image_id별 object 수를 카운트.
 
-    Object-Centric 확장:
-      - 각 샘플에 'annotations' 필드가 있으면 n_objects 추출
-      - n_objects: EOS 위치 결정에 사용 (COCO GT object 수)
+    Dataset.__init__에서 1회만 호출. Worker 수만큼 복사되지 않도록
+    최대한 가볍게 dict만 반환.
+
+    Returns:
+        {str(image_id): n_objects} - image_id를 str로 통일 (파일명 파싱과 맞추기 위해)
+    """
+    if annotation_path is None or not os.path.exists(annotation_path):
+        logger_module.warning(
+            f"[OC] COCO annotation 파일을 찾을 수 없음: {annotation_path}. "
+            "n_objects=0으로 대체합니다."
+        )
+        return {}
+
+    logger_module.info(f"[OC] COCO annotation 로드 중: {annotation_path}")
+    n_objects_map: Dict[str, int] = {}
+
+    with open(annotation_path, 'r') as f:
+        coco = json.load(f)
+
+    for ann in coco.get('annotations', []):
+        img_id = str(ann['image_id'])
+        n_objects_map[img_id] = n_objects_map.get(img_id, 0) + 1
+
+    logger_module.info(
+        f"[OC] COCO annotation 로드 완료: {len(n_objects_map)}개 이미지, "
+        f"평균 {sum(n_objects_map.values()) / max(len(n_objects_map), 1):.1f} objects/image"
+    )
+    return n_objects_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset - COCO Only (Text 없음)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class COCOReconstructionDataset(Dataset):
+    """
+    COCO 이미지 전용 재구성 데이터셋.
+
+    - Text 없음: conversations 무시, 이미지만 로드
+    - n_objects: instances_train2017.json에서 image_id별 annotation 수
+    - 각 샘플: {image_tensor, n_objects, image_id, raw_image_path}
+
+    data_path 형식:
+        각 줄이 JSON인 jsonl 파일.
+        {"image": "000000391895.jpg"} 또는
+        {"image": "000000391895.jpg", "image_id": "391895"}
+        image_id 없으면 파일명에서 숫자 파싱.
     """
 
     def __init__(
         self,
         data_path:     str,
-        tokenizer:     transformers.PreTrainedTokenizer,
         data_args:     DataArguments,
         model_configs  = None,
     ):
         super().__init__()
-        self.tokenizer     = tokenizer
         self.data_path     = data_path
         self.data_args     = data_args
         self.model_configs = model_configs
 
-        # offset index 구축 (빠른 random access)
+        # offset 인덱스 구축 (random access용)
         self._build_offset_index()
+
+        # COCO n_objects 매핑 로드 (1회)
+        coco_ann_path = getattr(data_args, 'coco_annotation_path', None)
+        self.n_objects_map = load_coco_n_objects(coco_ann_path)
+
+        logger_module.info(
+            f"[COCODataset] {self.length}개 샘플 로드. "
+            f"n_objects_map size: {len(self.n_objects_map)}"
+        )
 
     def _build_offset_index(self):
         self.offsets = []
         with open(self.data_path, "rb") as f:
             off = 0
             for line in f:
-                self.offsets.append(off)
-                off += len(line)
+                line = line.strip()
+                if line:  # 빈 줄 스킵
+                    self.offsets.append(off)
+                off += len(line) + 1  # +1 for newline
         self.length = len(self.offsets)
 
     def __len__(self):
         return self.length
 
-    def _has_image(self, sample: dict) -> bool:
-        return "image" in sample and str(sample['image']) not in ('', 'None', 'none', 'nan')
-
-    def _has_video(self, sample: dict) -> bool:
-        return "video" in sample and str(sample['video']) not in ('', 'None', 'none', 'nan')
-
     @property
     def modality_lengths(self):
-        lengths = []
-        with open(self.data_path, 'r') as f:
-            for line in f:
-                sample = json.loads(line.strip())
-                has_img = self._has_image(sample)
-                cur_len = sum(len(c['value'].split()) for c in sample['conversations'])
-                lengths.append(cur_len if has_img else -cur_len)
-        return lengths
+        """LengthGroupedSampler용: 모두 이미지 샘플이므로 양수 고정값."""
+        return [256] * self.length  # tokens_per_image
+
+    def _parse_image_id(self, dat: dict, image_path: str) -> str:
+        """
+        image_id 추출.
+        json에 명시된 경우 우선, 없으면 파일명에서 숫자 파싱.
+        """
+        if 'image_id' in dat:
+            return str(dat['image_id'])
+        # 파일명에서 숫자만 추출: "000000391895.jpg" → "391895"
+        basename = os.path.splitext(os.path.basename(image_path))[0]
+        digits = re.sub(r'^0+', '', re.sub(r'\D', '', basename))
+        return digits if digits else basename
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         try:
@@ -321,161 +274,97 @@ class LazySupervisedDataset(Dataset):
             line = f.readline()
         dat = json.loads(line)
 
-        sources  = [dat]
-        has_image = self._has_image(dat)
-        has_video = self._has_video(dat)
+        # ── 이미지 경로 파싱 ─────────────────────────────────────
+        image_file = dat.get('image', dat.get('source_path', ''))
+        if not image_file:
+            raise ValueError(f"샘플 {i}에 image 필드 없음: {dat}")
 
-        assert not (has_image and has_video), "이미지와 비디오를 동시에 사용할 수 없습니다."
+        image_folder = self.data_args.image_folder or ''
+        full_path = (
+            image_file if os.path.isabs(image_file)
+            else os.path.join(image_folder, image_file)
+        )
 
-        # 이미지 토큰 삽입
-        if has_image or has_video:
-            for source in sources:
-                if DEFAULT_IMAGE_TOKEN not in json.dumps(source['conversations']):
-                    source['conversations'][0]['value'] = DEFAULT_IMAGE_TOKEN + '\n' + source['conversations'][0]['value']
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"이미지 파일 없음: {full_path}")
 
-        vision_token_len      = self.data_args.vision_tower_aux_token_len_list[0]
-        processor_aux_list    = self.data_args.image_processor_aux_list
-        tokens_per_image      = vision_token_len
+        image = Image.open(full_path).convert('RGB')
 
-        if has_image:
-            image_file = dat['image']
-            if not isinstance(image_file, list):
-                image_file = [image_file]
-            image_folder = self.data_args.image_folder
-
-            images = []
-            for img_path in image_file:
-                full_path = img_path if os.path.isabs(img_path) else os.path.join(image_folder, img_path)
-                images.append(Image.open(full_path).convert('RGB'))
-
-            max_length = self.model_configs.tokenizer_model_max_length
-            if len(images) > (max_length // vision_token_len) - 1:
-                import random
-                return self.__getitem__(random.randint(0, len(self) - 1))
-
-            image_size = images[0].size
-
-            # Square mode 처리
-            image_aux_list = []
-            if self.data_args.image_aspect_ratio == 'square':
-                for image in images:
-                    img_tensor = processor_aux_list[0].preprocess(image, return_tensors='pt')['pixel_values'][0]
-                    image_aux_list.append(img_tensor)
-
-            sources = preprocess_multimodal(
-                copy.deepcopy([e["conversations"] for e in sources]),
-                self.data_args,
-            )
-
-        else:
-            sources    = copy.deepcopy([e["conversations"] for e in sources])
-            images     = []
-            image_size = (336, 336)
-
-        # 토크나이징
-        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
-        if isinstance(i, int):
-            data_dict = dict(
-                input_ids=data_dict["input_ids"][0],
-                labels=data_dict["labels"][0],
-            )
-
-        # labels 전체 IGNORE면 skip
-        if (data_dict['labels'] != IGNORE_INDEX).sum() == 0:
-            import random
-            return self.__getitem__(random.randint(0, len(self) - 1))
-
-        # 이미지 패딩
-        if has_image and self.data_args.image_aspect_ratio == 'square':
-            n_imgs = len(image_aux_list)
-            processor_aux = processor_aux_list[0]
-            image_aux_padded = torch.zeros(
-                self.data_args.max_images_per_sample,
-                3,
-                processor_aux.crop_size['height'],
-                processor_aux.crop_size['width'],
-            )
-            for idx, img_t in enumerate(image_aux_list):
-                image_aux_padded[idx] = img_t
-            data_dict['image_aux_list'] = [image_aux_padded]
-
-            # vision_token_indices
-            T       = self.data_args.max_images_per_sample * tokens_per_image
-            used    = n_imgs * tokens_per_image
-            PAD_VAL = T + 1
-            vti = torch.full((T,), PAD_VAL, dtype=torch.long)
-            if used:
-                vti[:used] = torch.arange(used, dtype=torch.long)
-            data_dict["vision_token_indices"] = vti.sort()[1]
-
-            # input_ids 재구성
-            input_ids = data_dict['input_ids']
-            labels    = data_dict['labels']
-            img_pos   = torch.where(input_ids == IMAGE_TOKEN_INDEX)[0].tolist()
-            max_imgs  = min(len(img_pos), self.data_args.max_images_per_sample)
-
-            new_ids, new_lbl, last = [], [], 0
-            for idx, pos in enumerate(img_pos[:max_imgs]):
-                new_ids.append(input_ids[last:pos])
-                new_lbl.append(labels[last:pos])
-                new_ids.append(torch.full((tokens_per_image,), IMAGE_TOKEN_INDEX, dtype=input_ids.dtype))
-                new_lbl.append(torch.full((tokens_per_image,), IGNORE_INDEX,       dtype=labels.dtype))
-                last = pos + 1
-            if last < len(input_ids):
-                new_ids.append(input_ids[last:])
-                new_lbl.append(labels[last:])
-
-            data_dict['input_ids'] = torch.cat(new_ids)
-            data_dict['labels']    = torch.cat(new_lbl)
-            data_dict['pseudo_img_tokens'] = torch.full(
-                ((self.data_args.max_images_per_sample - n_imgs) * tokens_per_image,),
-                IMAGE_TOKEN_INDEX, dtype=input_ids.dtype,
-            )
-
-            # 길이 클리핑
-            ml = self.model_configs.tokenizer_model_max_length
-            if len(data_dict['input_ids']) > ml:
-                data_dict['input_ids'] = data_dict['input_ids'][:ml]
-                data_dict['labels']    = data_dict['labels'][:ml]
-
-        elif not has_image and self.data_args.is_multimodal:
-            # 이미지 없는 텍스트 전용 샘플
-            processor_aux = processor_aux_list[0]
-            image_aux_padded = torch.zeros(
-                self.data_args.max_images_per_sample, 3,
-                processor_aux.crop_size['height'], processor_aux.crop_size['width'],
-            )
-            data_dict['image_aux_list'] = [image_aux_padded]
-
-            T       = self.data_args.max_images_per_sample * tokens_per_image
-            PAD_VAL = T + 1
-            vti = torch.full((T,), PAD_VAL, dtype=torch.long)
-            data_dict["vision_token_indices"] = vti.sort()[1]
-            data_dict['pseudo_img_tokens'] = torch.full(
-                (self.data_args.max_images_per_sample * tokens_per_image,),
-                IMAGE_TOKEN_INDEX,
-            )
-
-        data_dict['image_size'] = image_size
-        data_dict['has_video']  = has_video
-        data_dict['has_image']  = has_image
-
-        # ─── Object-Centric: GT object 수 추출 ──────────────────
-        use_oc       = getattr(self.model_configs, 'use_object_centric', False)
+        # ── image_id 및 n_objects 추출 ────────────────────────────
+        image_id = self._parse_image_id(dat, image_file)
         oc_max_slots = getattr(self.model_configs, 'oc_max_slots', 10)
 
-        if use_oc and has_image:
-            # COCO annotations 필드에서 object 수 추출
-            # dat 구조: {"image": ..., "conversations": ..., "annotations": [...]}
-            # annotations가 없으면 0
-            n_objects = len(dat.get('annotations', []))
-            # max_slots - 1 로 클리핑 (마지막 슬롯이 EOS)
-            n_objects = min(n_objects, oc_max_slots - 1)
-            data_dict['n_objects'] = torch.tensor(n_objects, dtype=torch.long)
-        else:
-            data_dict['n_objects'] = torch.tensor(0, dtype=torch.long)
+        # instances_train2017.json 기반 n_objects
+        raw_n_objects = self.n_objects_map.get(image_id, 0)
+        # EOS 슬롯 위치를 고려해 max_slots-1로 클리핑
+        n_objects = min(raw_n_objects, oc_max_slots - 1)
 
-        return data_dict
+        if raw_n_objects == 0:
+            logger_module.debug(
+                f"[OC] image_id={image_id} annotation 없음 (n_objects=0). "
+                "EOS가 첫 슬롯에 올 것."
+            )
+
+        # ── 이미지 전처리 ─────────────────────────────────────────
+        processor_aux_list = self.data_args.image_processor_aux_list
+        processor_aux = processor_aux_list[0]
+
+        if self.data_args.image_aspect_ratio == 'square':
+            image_tensor = processor_aux.preprocess(
+                image, return_tensors='pt'
+            )['pixel_values'][0]  # (3, H, W)
+        else:
+            raise NotImplementedError(
+                f"image_aspect_ratio={self.data_args.image_aspect_ratio} "
+                "는 COCO OC 모드에서 미지원. 'square' 사용."
+            )
+
+        # ── vision_token_indices 구성 ─────────────────────────────
+        tokens_per_image = self.data_args.vision_tower_aux_token_len_list[0]
+        T       = self.data_args.max_images_per_sample * tokens_per_image
+        PAD_VAL = T + 1
+        vti = torch.full((T,), PAD_VAL, dtype=torch.long)
+        vti[:tokens_per_image] = torch.arange(tokens_per_image, dtype=torch.long)
+        vision_token_indices = vti.sort()[1]
+
+        # ── input_ids: 이미지 토큰만으로 구성 ────────────────────
+        # Text 없음 → IMAGE_TOKEN_INDEX × tokens_per_image
+        input_ids = torch.full(
+            (tokens_per_image,), IMAGE_TOKEN_INDEX, dtype=torch.long
+        )
+        # labels: 전부 IGNORE (vision loss만 사용)
+        labels = torch.full(
+            (tokens_per_image,), IGNORE_INDEX, dtype=torch.long
+        )
+
+        # ── 이미지 패딩 (max_images_per_sample 기준) ─────────────
+        image_aux_padded = torch.zeros(
+            self.data_args.max_images_per_sample,
+            3,
+            processor_aux.crop_size['height'],
+            processor_aux.crop_size['width'],
+        )
+        image_aux_padded[0] = image_tensor
+
+        # pseudo_img_tokens (padding용)
+        pseudo_img_tokens = torch.full(
+            ((self.data_args.max_images_per_sample - 1) * tokens_per_image,),
+            IMAGE_TOKEN_INDEX,
+            dtype=torch.long,
+        )
+
+        return {
+            'input_ids':            input_ids,
+            'labels':               labels,
+            'image_aux_list':       [image_aux_padded],
+            'vision_token_indices': vision_token_indices,
+            'pseudo_img_tokens':    pseudo_img_tokens,
+            'n_objects':            torch.tensor(n_objects, dtype=torch.long),
+            'image_id':             image_id,
+            'image_size':           image.size,  # (W, H)
+            'has_image':            True,
+            'has_video':            False,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,52 +372,47 @@ class LazySupervisedDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class DataCollatorForSupervisedDataset:
+class DataCollatorForCOCODataset:
     """
-    Supervised dataset collator (Object-Centric 확장 포함).
+    COCO OC 전용 Collator.
 
-    OC 확장:
-      - n_objects: (B,) long tensor - GT object 수
-      - answer_img_mask, reverse_vti: vision loss 계산용
+    핵심 변경:
+      - n_objects: (B,) long tensor
+      - raw_images: (B, 3, H, W) float tensor
+        → model.forward에서 vision tower로 encode → gt_image_features
+      - text 없으므로 tokenizer pad 불필요하지만 호환성 유지
     """
 
     tokenizer:             transformers.PreTrainedTokenizer
     max_images_per_sample: int  = 1
     tokens_per_image:      int  = 256
-    video_max_frames:      int  = 0
-    miv_token_len:         int  = 196
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids = [inst["input_ids"]   for inst in instances]
-        labels    = [inst["labels"]      for inst in instances]
-        pseudo    = [inst.get("pseudo_img_tokens", torch.tensor([], dtype=torch.long)) for inst in instances]
-        vti       = [inst.get("vision_token_indices", torch.tensor([], dtype=torch.long)) for inst in instances]
+        B = len(instances)
 
-        max_len      = self.tokenizer.model_max_length
-        pad_id       = self.tokenizer.pad_token_id
+        # ── input_ids / labels ───────────────────────────────────
+        # Text 없음: 모두 이미지 토큰만
+        max_len = max(len(inst['input_ids']) for inst in instances)
 
-        def pad_or_trunc(seq, max_l, pad_val, right=True):
-            seq = seq[:max_l]
-            if len(seq) < max_l:
-                pad = torch.full((max_l - len(seq),), pad_val, dtype=seq.dtype)
-                seq = torch.cat([seq, pad]) if right else torch.cat([pad, seq])
-            return seq
+        input_ids_list, labels_list = [], []
+        for inst in instances:
+            ids = inst['input_ids']
+            lbl = inst['labels']
+            # pad to max_len
+            pad_len = max_len - len(ids)
+            if pad_len > 0:
+                ids = torch.cat([ids, torch.full((pad_len,), self.tokenizer.pad_token_id)])
+                lbl = torch.cat([lbl, torch.full((pad_len,), IGNORE_INDEX)])
+            input_ids_list.append(ids)
+            labels_list.append(lbl)
 
-        input_ids = torch.stack([pad_or_trunc(t, max_len, pad_id)     for t in input_ids])
-        labels    = torch.stack([pad_or_trunc(t, max_len, IGNORE_INDEX) for t in labels])
-        pseudo    = torch.stack([pad_or_trunc(t, max_len, pad_id)     for t in pseudo])
+        input_ids      = torch.stack(input_ids_list)
+        labels         = torch.stack(labels_list)
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
 
-        # vision_token_indices를 offset으로 변환
-        token_indices_list = []
-        for _ids, _vti in zip(input_ids, vti):
-            _tok = torch.arange(max_len)
-            n_img_toks = (_ids == IMAGE_TOKEN_INDEX).sum()
-            if len(_vti) > 0:
-                _tok[_ids == IMAGE_TOKEN_INDEX] = _vti[:n_img_toks] + max_len
-            token_indices_list.append(_tok)
-
-        vision_token_indices = torch.stack(token_indices_list)
-        attention_mask       = input_ids.ne(pad_id)
+        # ── vision_token_indices ─────────────────────────────────
+        vti_list = [inst['vision_token_indices'] for inst in instances]
+        vision_token_indices = torch.stack(vti_list)
 
         batch = dict(
             input_ids=input_ids,
@@ -537,60 +421,45 @@ class DataCollatorForSupervisedDataset:
             vision_token_indices=vision_token_indices,
         )
 
-        # 이미지 처리
+        # ── images ───────────────────────────────────────────────
         if 'image_aux_list' in instances[0]:
+            # image_aux_list: list of [padded_tensor(max_imgs, 3, H, W)]
             image_aux_list = [inst['image_aux_list'] for inst in instances]
             image_aux_list = [list(x) for x in zip(*image_aux_list)]
-            if all(x.shape == image_aux_list[0][0].shape for x in image_aux_list[0]):
-                batch["images"] = [torch.cat(imgs, dim=0) for imgs in image_aux_list][0]
-            else:
-                raise NotImplementedError("이미지 shape 불일치")
+            batch['images'] = torch.cat(image_aux_list[0], dim=0)  # (B*max_imgs, 3, H, W)
 
-        # ── answer_img_mask, reverse_vti 구성 ───────────────────
-        Lmax = max_len
+        # ── n_objects ────────────────────────────────────────────
+        if 'n_objects' in instances[0]:
+            batch['n_objects'] = torch.stack(
+                [inst['n_objects'] for inst in instances]
+            )  # (B,)
+
+        # ── answer_img_mask / reverse_vti ────────────────────────
+        # OC + COCO-only: 모든 이미지가 "answer" (재구성 대상)
         Mmax = self.max_images_per_sample
         P    = self.tokens_per_image
         Tmax = Mmax * P
+        Lmax = max_len
 
-        ans_tok_list  = []
-        ans_img_list  = []
-        rev_vti_list  = []
-
-        for ids, lab, vti_t in zip(input_ids, labels, vision_token_indices):
-            ans_img_mask = torch.zeros(Mmax, dtype=torch.bool)
-            img_pos      = (ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).squeeze(-1)
-            n_img_toks   = img_pos.numel()
-            n_images     = n_img_toks // P
-
-            for img_idx in range(n_images):
-                first_tok = img_pos[img_idx * P]
-                if first_tok > 0 and lab[first_tok - 1] != IGNORE_INDEX:
-                    ans_img_mask[img_idx] = True
-
-            ans_tok_mask = torch.zeros(Lmax, dtype=torch.bool)
-            for img_idx in range(n_images):
-                if ans_img_mask[img_idx]:
-                    start = img_idx * P
-                    end   = start + P
-                    tok   = img_pos[start:end]
-                    ans_tok_mask[tok] = True
-
-            rev_vti = torch.arange(Tmax, dtype=torch.long)
-            if n_img_toks > 0:
-                patch_rows = (vti_t[img_pos] - Lmax)
-                rev_vti[patch_rows] = Tmax + img_pos
-
-            ans_tok_list.append(ans_tok_mask)
+        ans_img_list, rev_vti_list = [], []
+        for ids, vti in zip(input_ids, vision_token_indices):
+            # 모든 이미지가 answer
+            ans_img_mask = torch.ones(Mmax, dtype=torch.bool)
+            ans_img_mask[1:] = False  # max_imgs_per_sample=1이면 [True]
             ans_img_list.append(ans_img_mask)
+
+            # reverse_vti
+            rev_vti = torch.arange(Tmax, dtype=torch.long)
+            img_pos = (ids == IMAGE_TOKEN_INDEX).nonzero(as_tuple=False).squeeze(-1)
+            n_img_toks = img_pos.numel()
+            if n_img_toks > 0:
+                patch_rows = (vti[img_pos] - Lmax).clamp(0, Tmax - 1)
+                rev_vti[patch_rows] = Tmax + img_pos
             rev_vti_list.append(rev_vti)
 
-        batch['answer_token_mask'] = torch.stack(ans_tok_list)
-        batch['answer_img_mask']   = torch.stack(ans_img_list)
-        batch['reverse_vti']       = torch.stack(rev_vti_list)
-
-        # ─── Object-Centric: n_objects collate ─────────────────
-        if 'n_objects' in instances[0]:
-            batch['n_objects'] = torch.stack([inst['n_objects'] for inst in instances])
+        batch['answer_img_mask'] = torch.stack(ans_img_list)    # (B, Mmax)
+        batch['reverse_vti']     = torch.stack(rev_vti_list)    # (B, Tmax)
+        batch['answer_token_mask'] = (input_ids == IMAGE_TOKEN_INDEX)  # (B, L)
 
         return batch
 
@@ -625,11 +494,11 @@ class LengthGroupedSampler(Sampler):
 
 class ScaleRAETrainer(Trainer):
     """
-    Scale-RAE 커스텀 트레이너.
+    Scale-RAE 커스텀 트레이너 (COCO OC 전용).
 
-    OC 확장:
+    compute_loss:
       - n_objects를 batch에서 꺼내 model.forward에 전달
-      - OC 손실 (fm_loss, eos_loss, div_loss) 로깅
+      - gt_image_features는 model 내부에서 자동 생성 (_oc_gt_cache 경유)
     """
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
@@ -662,28 +531,25 @@ class ScaleRAETrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
-        OC 모드일 때 n_objects와 gt_image_features를 model.forward에 전달.
+        OC 모드:
+          - n_objects: batch에서 추출해 model.forward에 전달
+          - gt_image_features: None 전달 → model 내부 _oc_gt_cache 사용
+            (scale_rae_arch.py의 prepare_inputs_labels_for_multimodal에서 캐싱됨)
         """
-        # n_objects 추출
         n_objects = inputs.pop("n_objects", None)
 
-        # gt_image_features: 학습 시 images_gen 또는 images에서 RAE encode 결과
-        # 현재 구현: None 전달 → model.forward 내부에서 처리
-        # 실제 사용 시 데이터 파이프라인에서 gt_image_features를 준비해야 함
-        gt_image_features = inputs.pop("gt_image_features", None)
-
+        # gt_image_features는 model.forward 내부에서 자동 처리
+        # (prepare_inputs_labels_for_multimodal → _oc_gt_cache)
         outputs = model(
             **inputs,
             n_objects=n_objects,
-            gt_image_features=gt_image_features,
+            gt_image_features=None,  # 내부에서 _oc_gt_cache로 처리
         )
 
-        loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
-
+        loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self):
-        """파라미터 그룹별 learning rate 설정."""
         opt_model = self.model
         if self.optimizer is not None:
             return self.optimizer
@@ -693,31 +559,52 @@ class ScaleRAETrainer(Trainer):
 
         if self.args.diff_head_lr is not None:
             diff_head_params = [n for n, _ in opt_model.named_parameters() if "diff_head" in n]
-            oc_params        = [
+            oc_params = [
                 n for n, _ in opt_model.named_parameters()
-                if any(k in n for k in ["slot_token_emb", "slot_eos_detector", "slot_aggregator", "null_slot_token"])
+                if any(k in n for k in [
+                    "slot_token_emb", "slot_eos_detector",
+                    "slot_aggregator", "null_slot_token"
+                ])
             ]
 
             optimizer_grouped_parameters = [
                 {
-                    "params": [p for n, p in opt_model.named_parameters()
-                               if n in decay_params and n not in diff_head_params and n not in oc_params and p.requires_grad],
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if n in decay_params
+                        and n not in diff_head_params
+                        and n not in oc_params
+                        and p.requires_grad
+                    ],
                     "weight_decay": self.args.weight_decay,
                 },
                 {
-                    "params": [p for n, p in opt_model.named_parameters()
-                               if n not in decay_params and n not in diff_head_params and n not in oc_params and p.requires_grad],
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if n not in decay_params
+                        and n not in diff_head_params
+                        and n not in oc_params
+                        and p.requires_grad
+                    ],
                     "weight_decay": 0.0,
                 },
                 {
-                    "params": [p for n, p in opt_model.named_parameters()
-                               if n in decay_params and (n in diff_head_params or n in oc_params) and p.requires_grad],
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if n in decay_params
+                        and (n in diff_head_params or n in oc_params)
+                        and p.requires_grad
+                    ],
                     "weight_decay": self.args.weight_decay,
                     "lr": self.args.diff_head_lr,
                 },
                 {
-                    "params": [p for n, p in opt_model.named_parameters()
-                               if n not in decay_params and (n in diff_head_params or n in oc_params) and p.requires_grad],
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if n not in decay_params
+                        and (n in diff_head_params or n in oc_params)
+                        and p.requires_grad
+                    ],
                     "weight_decay": 0.0,
                     "lr": self.args.diff_head_lr,
                 },
@@ -725,11 +612,17 @@ class ScaleRAETrainer(Trainer):
         else:
             optimizer_grouped_parameters = [
                 {
-                    "params": [p for n, p in opt_model.named_parameters() if n in decay_params and p.requires_grad],
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if n in decay_params and p.requires_grad
+                    ],
                     "weight_decay": self.args.weight_decay,
                 },
                 {
-                    "params": [p for n, p in opt_model.named_parameters() if n not in decay_params and p.requires_grad],
+                    "params": [
+                        p for n, p in opt_model.named_parameters()
+                        if n not in decay_params and p.requires_grad
+                    ],
                     "weight_decay": 0.0,
                 },
             ]
@@ -738,25 +631,24 @@ class ScaleRAETrainer(Trainer):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
         return self.optimizer
 
-    # ── logging: OC 손실 포함 ─────────────────────────────────────
-
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             logs: Dict[str, float] = {}
             tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
-            logs["loss"]          = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["loss"]          = round(
+                tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4
+            )
             logs["learning_rate"] = self._get_learning_rate()
 
-            if hasattr(model, 'loss_language') and model.loss_language is not None:
-                logs["loss_language"] = round(model.loss_language.item(), 4)
-
-            # OC 전용 손실
+            # OC 전용 손실 로깅
             if hasattr(model, 'loss_image_diff') and model.loss_image_diff is not None:
                 logs["loss_fm"]  = round(model.loss_image_diff.item(), 4)
             if hasattr(model, 'oc_eos_loss') and model.oc_eos_loss is not None:
                 logs["loss_eos"] = round(model.oc_eos_loss.item(), 4)
             if hasattr(model, 'oc_div_loss') and model.oc_div_loss is not None:
                 logs["loss_div"] = round(model.oc_div_loss.item(), 4)
+            if hasattr(model, 'loss_language') and model.loss_language is not None:
+                logs["loss_language"] = round(model.loss_language.item(), 4)
 
             tr_loss -= tr_loss
             self._total_loss_scalar += tr_loss_scalar
@@ -782,22 +674,23 @@ def make_supervised_data_module(
     data_args:     DataArguments,
     model_configs,
 ) -> Dict:
-    train_dataset = LazySupervisedDataset(
-        tokenizer=tokenizer,
+
+    train_dataset = COCOReconstructionDataset(
         data_path=data_args.data_path,
         data_args=data_args,
         model_configs=model_configs,
     )
 
-    tpi = model_configs.vision_tower_aux_token_len_list[0] \
-          if hasattr(model_configs, 'vision_tower_aux_token_len_list') else 256
+    tpi = (
+        model_configs.vision_tower_aux_token_len_list[0]
+        if hasattr(model_configs, 'vision_tower_aux_token_len_list')
+        else 256
+    )
 
-    data_collator = DataCollatorForSupervisedDataset(
+    data_collator = DataCollatorForCOCODataset(
         tokenizer=tokenizer,
         max_images_per_sample=getattr(data_args, 'max_images_per_sample', 1),
         tokens_per_image=tpi,
-        video_max_frames=getattr(data_args, 'video_max_frames', 0),
-        miv_token_len=getattr(data_args, 'miv_token_len', 196),
     )
 
     return dict(
@@ -829,29 +722,31 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    compute_dtype = (torch.float16 if training_args.fp16 else
-                     (torch.bfloat16 if training_args.bf16 else torch.float32))
+    compute_dtype = (
+        torch.float16 if training_args.fp16
+        else (torch.bfloat16 if training_args.bf16 else torch.float32)
+    )
 
-    # ── 모델 로드 ─────────────────────────────────────────────────
+    # ── Config 로드 ───────────────────────────────────────────────
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(model_args.model_name_or_path)
 
-    # vision 설정
-    config.vision_loss             = model_args.vision_loss
-    config.vision_loss_mode        = model_args.vision_loss_mode
-    config.vision_coef             = model_args.vision_coef
-    config.diffusion_model_hidden_size = model_args.diffusion_model_hidden_size
-    config.diffusion_model_channels    = model_args.diffusion_model_channels
-    config.diffusion_model_depth       = model_args.diffusion_model_depth
-    config.diffusion_model_heads       = model_args.diffusion_model_heads
-    config.diffusion_model_z_channels  = model_args.diffusion_model_z_channels
-    config.dit_cls                     = model_args.dit_cls
+    config.vision_loss                  = model_args.vision_loss
+    config.vision_loss_mode             = model_args.vision_loss_mode
+    config.vision_coef                  = model_args.vision_coef
+    config.diffusion_model_hidden_size  = model_args.diffusion_model_hidden_size
+    config.diffusion_model_channels     = model_args.diffusion_model_channels
+    config.diffusion_model_depth        = model_args.diffusion_model_depth
+    config.diffusion_model_heads        = model_args.diffusion_model_heads
+    config.diffusion_model_z_channels   = model_args.diffusion_model_z_channels
+    config.dit_cls                      = model_args.dit_cls
 
-    # ── OC 설정 적용 ──────────────────────────────────────────────
+    # OC 설정
     config.use_object_centric = model_args.use_object_centric
     config.oc_max_slots       = model_args.oc_max_slots
-    config.oc_d_model         = config.hidden_size   # LLM hidden_size와 동일
+    config.oc_d_model         = config.hidden_size
 
+    # ── 모델 로드 ─────────────────────────────────────────────────
     model = ScaleRAEQwenForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -859,7 +754,7 @@ def train(attn_implementation=None):
     )
     model.config.use_cache = False
 
-    # ── tokenizer ────────────────────────────────────────────────
+    # ── Tokenizer ─────────────────────────────────────────────────
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         model_max_length=training_args.model_max_length,
@@ -868,11 +763,12 @@ def train(attn_implementation=None):
     )
     tokenizer.pad_token    = "<|endoftext|>"
     tokenizer.pad_token_id = 151643
+
     conversation_lib.default_conversation = conversation_lib.conv_templates.get(
         model_args.version, conversation_lib.conv_templates["qwen_2"]
     )
 
-    # ── vision modules 초기화 ────────────────────────────────────
+    # ── Vision modules 초기화 ─────────────────────────────────────
     if model_args.vision_tower_aux_list is not None:
         model_args.vision_tower_aux_list           = json.loads(model_args.vision_tower_aux_list)
         model_args.vision_tower_aux_token_len_list = json.loads(model_args.vision_tower_aux_token_len_list)
@@ -889,13 +785,19 @@ def train(attn_implementation=None):
         data_args.image_processor_aux_list = [vt.image_processor for vt in vision_tower_aux_list]
         data_args.is_multimodal            = True
 
-        model.config.image_aspect_ratio           = data_args.image_aspect_ratio
-        model.config.tokenizer_model_max_length   = tokenizer.model_max_length
+        # vision_tower_aux_token_len_list을 data_args에도 저장
+        data_args.vision_tower_aux_token_len_list = model_args.vision_tower_aux_token_len_list
+
+        model.config.image_aspect_ratio              = data_args.image_aspect_ratio
+        model.config.tokenizer_model_max_length      = tokenizer.model_max_length
         model.config.vision_tower_aux_token_len_list = model_args.vision_tower_aux_token_len_list
-        model.config.si_token_len  = model_args.si_token_len
-        model.config.miv_token_len = model_args.miv_token_len
-        model.config.use_object_centric = model_args.use_object_centric
-        model.config.oc_max_slots       = model_args.oc_max_slots
+        model.config.si_token_len                    = model_args.si_token_len
+        model.config.miv_token_len                   = model_args.miv_token_len
+        model.config.use_object_centric              = model_args.use_object_centric
+        model.config.oc_max_slots                    = model_args.oc_max_slots
+
+    # ── COCO annotation 경로 전달 ─────────────────────────────────
+    data_args.coco_annotation_path = getattr(model_args, 'coco_annotation_path', None)
 
     # ── Freeze / Trainable 설정 ───────────────────────────────────
     if model_args.freeze_backbone:
@@ -905,7 +807,6 @@ def train(attn_implementation=None):
         model.requires_grad_(False)
         tune_keywords = [
             'mm_projector', 'vision_head', 'diff_head', 'latent_queries',
-            # OC 모듈 학습 가능
             'slot_token_emb', 'slot_eos_detector', 'slot_aggregator', 'null_slot_token',
         ]
         for name, param in model.named_parameters():
@@ -933,7 +834,6 @@ def train(attn_implementation=None):
 
     model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
-    # ── im_start / im_end token id 저장 ─────────────────────────
     if model_args.mm_use_im_start_end:
         vocab = tokenizer.get_vocab()
         if DEFAULT_IM_START_TOKEN in vocab:
@@ -951,13 +851,11 @@ def train(attn_implementation=None):
         **data_module,
     )
 
-    # 체크포인트 재개
     resume = training_args.resume_from_checkpoint or None
     trainer.train(resume_from_checkpoint=resume)
     trainer.save_state()
     model.config.use_cache = True
 
-    # 최종 저장
     if training_args.lora_enable:
         from peft import get_peft_model_state_dict
         state_dict = get_peft_model_state_dict(model)
