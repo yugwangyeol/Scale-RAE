@@ -11,7 +11,12 @@ import numpy as np
 import gcsfs
 # from google.cloud import storage
 import io
-import torch_xla.core.xla_model as xm
+try:
+    import torch_xla.core.xla_model as xm
+    # 혹시 파일 상단에 다른 torch_xla 관련 import가 있다면 모두 이 블록 안으로 넣어주세요.
+    # 예: import torch_xla.runtime as xr 
+except ImportError:
+    pass
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from transformers import Trainer
 from transformers.trainer import (
@@ -756,7 +761,10 @@ class ScaleRAETrainer(Trainer):
 
     def get_train_dataloader(self) -> DataLoader:
         out = super().get_train_dataloader()
-        return out._loader
+        # GPU 환경에서는 _loader 속성이 없으므로, 속성이 있을 때만(TPU) 꺼내고 아닐 땐 그대로 반환합니다.
+        if hasattr(out, '_loader'):
+            return out._loader
+        return out
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
