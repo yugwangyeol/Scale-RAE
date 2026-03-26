@@ -114,7 +114,7 @@ echo "=============================================================="
     --max_images_per_sample 1 \
     \
     --output_dir "${OUTPUT_DIR}" \
-    --num_train_epochs 10 \
+    --num_train_epochs 100 \
     --per_device_train_batch_size 64 \
     --gradient_accumulation_steps 2 \
     --learning_rate 1e-4 \

@@ -698,13 +698,13 @@ class ScaleRAETrainer(Trainer):
         loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
 
         # 개별 loss 값 누적 (logging_steps 창 평균용)
+        # loss_language는 텍스트 입력이 없어 항상 0 → 제외
         if model.training:
             inner = model.module if hasattr(model, 'module') else model
             for key, attr in [
-                ("loss_fm",       "loss_image_diff"),
-                ("loss_eos",      "oc_eos_loss"),
-                ("loss_div",      "oc_div_loss"),
-                ("loss_language", "loss_language"),
+                ("loss_fm",  "loss_image_diff"),
+                ("loss_eos", "oc_eos_loss"),
+                ("loss_div", "oc_div_loss"),
             ]:
                 val = getattr(inner, attr, None)
                 if val is not None:
@@ -1089,6 +1089,21 @@ def train(attn_implementation=None):
         for name, param in model.named_parameters():
             if 'diff_head' in name and 'adaLN_modulation' in name:
                 param.requires_grad = True
+
+        # adaLN을 zero-init으로 재설정 (랜덤 초기화 방지)
+        # DiT 원 구현과 동일: zero-init → scale=0, shift=0 → identity 출력
+        # 초기 fm_loss 폭발을 방지하고 안정적인 학습 시작을 보장
+        n_reset = 0
+        for name, param in model.named_parameters():
+            if 'diff_head' in name and 'adaLN_modulation' in name:
+                if name.endswith('.weight') or name.endswith('.bias'):
+                    # adaLN_modulation[-1](=Linear)만 zero-init
+                    # Sequential 내 마지막 linear 판별: '.1.weight' or '.1.bias'
+                    if '.1.weight' in name or '.1.bias' in name:
+                        torch.nn.init.constant_(param, 0.0)
+                        n_reset += 1
+        if n_reset > 0:
+            print(f"[Init] adaLN zero-init 적용: {n_reset}개 파라미터 → 초기 FM loss 안정화")
 
     if model_args.tune_mm_mlp_adapter:
         model.requires_grad_(False)
