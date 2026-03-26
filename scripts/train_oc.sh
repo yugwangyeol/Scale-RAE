@@ -132,7 +132,7 @@ echo "=============================================================="
     --save_steps 500 \
     --save_total_limit 3 \
     --evaluation_strategy steps \
-    --eval_steps 500 \
+    --eval_steps 10 \
     --logging_steps 10 \
     --report_to wandb \
     --run_name "${EXPERIMENT_NAME}" \

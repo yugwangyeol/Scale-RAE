@@ -727,19 +727,19 @@ class ScaleRAETrainer(Trainer):
         if self._image_decoder is None:
             return []
         try:
-            device = feats.device
-            dtype  = feats.dtype
-            dec = self._image_decoder.to(device=device, dtype=dtype)
-            B, N, C = feats.shape
+            # 디코더는 CPU에 유지하고 피처를 CPU로 내려서 디바이스 불일치 방지
+            feats_cpu = feats.detach().cpu().float()
+            dec = self._image_decoder.cpu().float()
+            B, N, C = feats_cpu.shape
             # prepend dummy CLS token
-            cls_tok = torch.zeros(B, 1, C, device=device, dtype=dtype)
-            dec_input = torch.cat([cls_tok, feats], dim=1)  # (B, 257, 1152)
+            cls_tok = torch.zeros(B, 1, C, dtype=torch.float32)
+            dec_input = torch.cat([cls_tok, feats_cpu], dim=1)  # (B, 257, 1152)
             with torch.no_grad():
                 imgs = dec(dec_input).clamp(0, 1)  # (B, 3, H, W)
-            arr = imgs.cpu().float().permute(0, 2, 3, 1).numpy()
+            arr = imgs.permute(0, 2, 3, 1).numpy()
             return [PIL.Image.fromarray((arr[i] * 255).astype(np.uint8)) for i in range(B)]
         except Exception as e:
-            logger_module.warning(f"[eval] decoder failed: {e}")
+            logger_module.warning(f"[eval] decoder failed: {e}", exc_info=True)
             return []
 
     def _tensor_to_pil(self, imgs: torch.Tensor) -> List[PIL.Image.Image]:
@@ -754,7 +754,13 @@ class ScaleRAETrainer(Trainer):
         return [PIL.Image.fromarray((arr[i] * 255).astype(np.uint8)) for i in range(len(arr))]
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """Eval 스텝: 손실 계산 + Source/GT/Pred 이미지 W&B 로깅."""
+        """Eval 스텝: 손실 계산 + Source/GT/Pred 이미지 W&B 로깅.
+
+        버그 수정:
+          - HF Trainer가 compute_metrics=None 일 때 prediction_loss_only=True 로 호출
+            → 이미지 생성 코드가 절대 실행되지 않는 문제 수정
+          - 첫 배치에만 이미지를 생성해 오버헤드 최소화
+        """
         if inputs is None:
             return (None, None, None)
 
@@ -768,46 +774,85 @@ class ScaleRAETrainer(Trainer):
             if isinstance(loss, torch.Tensor) and loss.dim() > 0:
                 loss = loss.mean()
 
-        if prediction_loss_only or not self.is_world_process_zero():
+        # 이미지 시각화: rank-0에서 eval 라운드당 첫 배치만 실행
+        # prediction_loss_only 무시 (HF 기본값이 True라 이미지 생성이 막히는 버그 수정)
+        if not self.is_world_process_zero():
             return (loss, None, None)
 
-        # 2. 시각화 (최대 4장)
-        imgs = []
-        try:
-            source = inputs.get("images")  # (B, 3, H, W) SigLIP normalized
-            gt_feats = getattr(inner, "_oc_gt_cache", None)
+        if not getattr(self, "_eval_images_logged_this_round", False):
+            self._eval_images_logged_this_round = True  # 이 eval 라운드에서 한 번만 실행
 
-            # 예측 피처 생성
-            pred_feats = None
-            if hasattr(inner, "is_object_centric") and inner.is_object_centric():
-                gen_result = inner.generate(
-                    inputs=inputs.get("input_ids"),
-                    images=inputs.get("images"),
-                    use_customize_greedy=True,
-                )
-                pred_feats = gen_result.get("pred_image")
+            imgs = []
+            try:
+                source   = inputs.get("images")           # (B, 3, H, W) SigLIP normalized
+                gt_feats = getattr(inner, "_oc_gt_cache", None)
 
-            n_show = min(4, source.shape[0] if source is not None else 0)
+                # 모델 compute dtype 파악 (bf16/fp16)
+                model_dtype = next(inner.parameters()).dtype
 
-            src_pil  = self._tensor_to_pil(source[:n_show])  if source     is not None else []
-            gt_pil   = self._feat_to_pil(gt_feats[:n_show])  if gt_feats   is not None else []
-            pred_pil = self._feat_to_pil(pred_feats[:n_show]) if pred_feats is not None else []
+                # 예측 피처 생성 (greedy decode)
+                # generate() 대신 prepare_inputs_labels_for_multimodal → greedy_decode_oc
+                # 직접 호출해야 vision_token_indices 등을 올바르게 전달 가능
+                pred_feats = None
+                if hasattr(inner, "is_object_centric") and inner.is_object_centric():
+                    images_for_gen = source.to(dtype=model_dtype) if source is not None else None
+                    (
+                        _, _, attn_mask, _, inputs_embeds, _,
+                        _, _, attn_bias, _,
+                    ) = inner.prepare_inputs_labels_for_multimodal(
+                        inputs.get("input_ids"),
+                        None,
+                        inputs.get("attention_mask"),
+                        None,
+                        None,
+                        images=images_for_gen,
+                        vision_token_indices=inputs.get("vision_token_indices"),
+                    )
+                    gen_result = inner.greedy_decode_oc(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attn_mask,
+                        attention_bias=attn_bias,
+                    )
+                    pred_feats = gen_result.get("pred_image")
 
-            for i in range(n_show):
-                if i < len(src_pil):
-                    imgs.append(wandb.Image(src_pil[i],  caption=f"{i} Source"))
-                if i < len(gt_pil):
-                    imgs.append(wandb.Image(gt_pil[i],   caption=f"{i} GT (SigLIP→Decoder)"))
-                if i < len(pred_pil):
-                    imgs.append(wandb.Image(pred_pil[i], caption=f"{i} Pred (DiT)"))
-        except Exception as e:
-            logger_module.warning(f"[eval] image generation failed: {e}")
+                n_show   = min(4, source.shape[0] if source is not None else 0)
+                src_pil  = self._tensor_to_pil(source[:n_show])    if source     is not None else []
+                gt_pil   = self._feat_to_pil(gt_feats[:n_show])    if gt_feats   is not None else []
+                pred_pil = self._feat_to_pil(pred_feats[:n_show])  if pred_feats is not None else []
 
-        if imgs and HAS_WANDB:
-            self.log_images({"eval_samples": imgs})
+                for i in range(n_show):
+                    if i < len(src_pil):
+                        imgs.append(wandb.Image(src_pil[i],  caption=f"{i} Source"))
+                    if i < len(gt_pil):
+                        imgs.append(wandb.Image(gt_pil[i],   caption=f"{i} GT (SigLIP→Decoder)"))
+                    if i < len(pred_pil):
+                        imgs.append(wandb.Image(pred_pil[i], caption=f"{i} Pred (DiT)"))
 
-        gc.collect()
+                if imgs and HAS_WANDB and wandb.run is not None:
+                    # self.log() 대신 wandb.log() 직접 호출 (Image 객체 안전하게 전달)
+                    wandb.log(
+                        {"eval/samples": imgs},
+                        step=self.state.global_step,
+                    )
+                    logger_module.info(
+                        f"[eval] W&B에 {len(imgs)}장 이미지 로깅 완료 (step={self.state.global_step})"
+                    )
+
+            except Exception as e:
+                logger_module.warning(f"[eval] image generation failed: {e}", exc_info=True)
+            finally:
+                gc.collect()
+
         return (loss, None, None)
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """eval 라운드 시작 시 이미지 로깅 플래그 초기화."""
+        self._eval_images_logged_this_round = False
+        return super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
 
     def create_optimizer(self):
         opt_model = self.model
