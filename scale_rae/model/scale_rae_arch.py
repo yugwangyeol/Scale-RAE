@@ -23,7 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 from .multimodal_encoder.builder import build_vision_tower_aux_list
 from .multimodal_projector.builder import build_vision_projector
@@ -136,8 +137,37 @@ class ScaleRAEMetaModel:
 
         if pretrain_adapter_and_vision_head is not None:
             logger.info(f"adapter+vision_head 가중치 로드: {pretrain_adapter_and_vision_head}")
-            weights       = torch.load(pretrain_adapter_and_vision_head, map_location='cpu')
-            model_weights = weights.get('model', weights)
+            if os.path.isdir(pretrain_adapter_and_vision_head):
+                # safetensors 형식 디렉토리 (HuggingFace 체크포인트)
+                # from_pretrained가 이미 기본 가중치를 로드했으므로
+                # model.safetensors.index.json이 있으면 safetensors로 로드
+                index_path = os.path.join(pretrain_adapter_and_vision_head, 'model.safetensors.index.json')
+                single_path = os.path.join(pretrain_adapter_and_vision_head, 'model.safetensors')
+                if os.path.isfile(index_path):
+                    import json
+                    from safetensors.torch import load_file as st_load
+                    with open(index_path) as f:
+                        index = json.load(f)
+                    shard_files = sorted(set(index['weight_map'].values()))
+                    model_weights = {}
+                    for shard in shard_files:
+                        shard_path = os.path.join(pretrain_adapter_and_vision_head, shard)
+                        model_weights.update(st_load(shard_path, device='cpu'))
+                elif os.path.isfile(single_path):
+                    from safetensors.torch import load_file as st_load
+                    model_weights = st_load(single_path, device='cpu')
+                else:
+                    # pytorch_model.bin fallback
+                    bin_path = os.path.join(pretrain_adapter_and_vision_head, 'pytorch_model.bin')
+                    if os.path.isfile(bin_path):
+                        weights = torch.load(bin_path, map_location='cpu')
+                        model_weights = weights.get('model', weights)
+                    else:
+                        logger.warning(f"pretrain_adapter_and_vision_head 디렉토리에서 가중치 파일을 찾을 수 없음: {pretrain_adapter_and_vision_head}")
+                        model_weights = {}
+            else:
+                weights = torch.load(pretrain_adapter_and_vision_head, map_location='cpu')
+                model_weights = weights.get('model', weights)
 
             def get_w(w, key):
                 return {k.split(key + '.')[1]: v for k, v in w.items() if key + '.' in k}
@@ -180,6 +210,14 @@ class ScaleRAEMetaForCausalLM(ABC):
         for image_aux, vt in zip(image_aux_list, vision_tower_aux_list):
             if len(image_aux.shape) == 3:
                 image_aux = image_aux.unsqueeze(0)
+            # vision tower는 plain list이므로 Trainer가 GPU로 이동시키지 않음
+            # 입력 텐서의 device에 맞춰 lazy하게 이동
+            try:
+                vt_device = next(vt.parameters()).device
+                if vt_device != image_aux.device:
+                    vt.to(image_aux.device)
+            except StopIteration:
+                pass
             features.append(vt(image_aux))
         return features
 
@@ -296,7 +334,7 @@ class ScaleRAEMetaForCausalLM(ABC):
         vision_loss_mode = getattr(self.get_model().config, 'vision_loss_mode', 'causal')
         use_query_mode   = vision_loss_mode in ("query", "half-query", "query-block")
 
-        if use_query_mode:
+        if use_query_mode and not use_oc:
             latent_queries = self.get_model().latent_queries
             if latent_queries is not None:
                 expanded_lq = latent_queries.unsqueeze(0).expand(batch_size, -1, -1)
@@ -342,12 +380,35 @@ class ScaleRAEMetaForCausalLM(ABC):
             slot_token_emb = getattr(self, 'slot_token_emb', None)
 
             if slot_token_emb is not None:
-                slot_tokens = slot_token_emb.expand(batch_size, oc_max_slots, -1)
-
-                # 시퀀스 분할
+                # ── OC: latent_query 직접 concat (answer_image_mask 우회) ──
                 n_img   = tokens_per_image * images_per_batch
-                n_query = tokens_per_image * images_per_batch if use_query_mode else 0
-                n_prefix = n_img + n_query  # img + query 합산
+                n_query = 0
+                if use_query_mode:
+                    lq = self.get_model().latent_queries
+                    if lq is not None:
+                        lq_expanded = lq.unsqueeze(0).expand(batch_size, -1, -1)
+                        lq_expanded = lq_expanded.repeat(1, images_per_batch, 1)
+                        input_embeds = torch.cat([input_embeds, lq_expanded], dim=1)
+                        n_lq = lq_expanded.shape[1]
+                        if attention_mask is not None:
+                            lq_attn = torch.ones(
+                                batch_size, n_lq,
+                                device=input_embeds.device,
+                                dtype=attention_mask.dtype,
+                            )
+                            attention_mask = torch.cat(
+                                [attention_mask, lq_attn], dim=1
+                            )
+                        if labels is not None:
+                            lq_labels = torch.full(
+                                (batch_size, n_lq), IGNORE_INDEX,
+                                dtype=labels.dtype, device=labels.device,
+                            )
+                            labels = torch.cat([labels, lq_labels], dim=1)
+                        n_query = n_lq
+
+                n_prefix = n_img + n_query
+                slot_tokens = slot_token_emb.expand(batch_size, oc_max_slots, -1)
 
                 img_query_part = input_embeds[:, :n_prefix, :]
                 text_part      = input_embeds[:, n_prefix:, :]
@@ -409,7 +470,7 @@ class ScaleRAEMetaForCausalLM(ABC):
                     )
                     labels = torch.cat([lbl_prefix, slot_labels, lbl_text_part], dim=1)
 
-                # OC Attention Bias 생성
+                # 완전한 4D attention mask 생성: OC 패턴 + 표준 causal + 패딩
                 from .object_centric.slot_generator import build_oc_attention_mask
                 oc_bias = build_oc_attention_mask(
                     n_img=n_img,
@@ -417,24 +478,36 @@ class ScaleRAEMetaForCausalLM(ABC):
                     n_slots=oc_max_slots,
                     device=input_embeds.device,
                     dtype=input_embeds.dtype,
-                )  # (n_img + n_query + n_slots, same)
+                )  # (L_oc, L_oc)
 
-                num_heads = getattr(self.get_model().config, 'num_attention_heads', 12)
                 L_total   = input_embeds.shape[1]
                 L_oc      = n_img + n_query + oc_max_slots
 
-                full_bias = torch.zeros(
-                    L_total, L_total,
-                    device=input_embeds.device,
-                    dtype=input_embeds.dtype,
+                min_dtype = torch.finfo(input_embeds.dtype).min
+                causal_mask = torch.triu(
+                    torch.full(
+                        (L_total, L_total), min_dtype,
+                        device=input_embeds.device, dtype=input_embeds.dtype,
+                    ),
+                    diagonal=1,
                 )
-                full_bias[:L_oc, :L_oc] = oc_bias
+                causal_mask[:L_oc, :L_oc] = oc_bias
 
+                # Qwen2/transformers는 (batch, 1, seq, seq) 형식을 요구함
+                # num_heads로 expand하면 안 됨 - 1로 유지해 broadcast
                 attention_bias = (
-                    full_bias
+                    causal_mask
                     .unsqueeze(0).unsqueeze(0)
-                    .expand(batch_size, num_heads, -1, -1)
+                    .expand(batch_size, 1, -1, -1)
                 )
+
+                if attention_mask is not None:
+                    padding_mask = (
+                        (1.0 - attention_mask[:, None, None, :].to(
+                            dtype=input_embeds.dtype))
+                        * min_dtype
+                    )
+                    attention_bias = attention_bias + padding_mask
 
         # ── 최종 길이 정렬 ────────────────────────────────────────
         if labels is not None:
@@ -442,6 +515,8 @@ class ScaleRAEMetaForCausalLM(ABC):
             if input_embeds.shape[1] > max_len:
                 input_embeds   = input_embeds[:, :max_len]
                 attention_mask = attention_mask[:, :max_len] if attention_mask is not None else None
+                if attention_bias is not None:
+                    attention_bias = attention_bias[:, :, :max_len, :max_len]
             elif input_embeds.shape[1] < max_len:
                 pad_len      = max_len - input_embeds.shape[1]
                 pad_embed    = torch.zeros(

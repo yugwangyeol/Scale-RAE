@@ -20,7 +20,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAn
 import torch
 from scale_rae.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 from scale_rae.model.language_model.scale_rae_qwen2 import ScaleRAEQwenForCausalLM
 

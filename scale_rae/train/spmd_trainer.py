@@ -12,6 +12,7 @@ Scale-RAE Trainer (GPU 버전, Object-Centric 확장 포함)
 
 import os
 import re
+import gc
 import math
 import copy
 import json
@@ -28,7 +29,7 @@ from torch.utils.data import Dataset, Sampler
 
 import transformers
 import tokenizers
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers.trainer import (
     get_parameter_names,
     has_length,
@@ -36,6 +37,20 @@ from transformers.trainer import (
     logger,
 )
 from packaging import version
+
+import PIL.Image
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
 
 from PIL import Image
 
@@ -91,7 +106,6 @@ class ModelArguments:
     diffusion_model_z_channels:  Optional[int]   = field(default=0)
     si_token_len:                int             = field(default=729)
     miv_token_len:               int             = field(default=196)
-    unfreeze_mm_vision_tower:    bool            = field(default=False)
 
     # ─── Object-Centric 설정 ──────────────────────────────────────
     use_object_centric: bool = field(
@@ -101,11 +115,6 @@ class ModelArguments:
     oc_max_slots: int = field(
         default=10,
         metadata={"help": "최대 slot 개수 (EOS 슬롯 포함)"},
-    )
-    # ─── COCO annotation 경로 ─────────────────────────────────────
-    coco_annotation_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "instances_train2017.json 경로 (n_objects 추출용)"},
     )
 
 
@@ -153,12 +162,19 @@ class TrainingArguments(transformers.TrainingArguments):
 # COCO Annotation 로더
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_coco_n_objects(annotation_path: str) -> Dict[str, int]:
+def load_coco_n_objects(
+    annotation_path: str,
+    min_area: float = 1024.0,
+) -> Dict[str, int]:
     """
     instances_train2017.json에서 image_id별 object 수를 카운트.
 
     Dataset.__init__에서 1회만 호출. Worker 수만큼 복사되지 않도록
     최대한 가볍게 dict만 반환.
+
+    Args:
+        annotation_path: COCO instances JSON 경로
+        min_area: 이 면적(px²) 미만의 annotation은 무시
 
     Returns:
         {str(image_id): n_objects} - image_id를 str로 통일 (파일명 파싱과 맞추기 위해)
@@ -177,12 +193,17 @@ def load_coco_n_objects(annotation_path: str) -> Dict[str, int]:
         coco = json.load(f)
 
     for ann in coco.get('annotations', []):
+        if ann.get('iscrowd', 0):
+            continue
+        if ann.get('area', 0) < min_area:
+            continue
         img_id = str(ann['image_id'])
         n_objects_map[img_id] = n_objects_map.get(img_id, 0) + 1
 
     logger_module.info(
         f"[OC] COCO annotation 로드 완료: {len(n_objects_map)}개 이미지, "
-        f"평균 {sum(n_objects_map.values()) / max(len(n_objects_map), 1):.1f} objects/image"
+        f"평균 {sum(n_objects_map.values()) / max(len(n_objects_map), 1):.1f} objects/image "
+        f"(min_area={min_area})"
     )
     return n_objects_map
 
@@ -233,11 +254,11 @@ class COCOReconstructionDataset(Dataset):
         self.offsets = []
         with open(self.data_path, "rb") as f:
             off = 0
-            for line in f:
-                line = line.strip()
-                if line:  # 빈 줄 스킵
+            for raw_line in f:
+                stripped = raw_line.strip()
+                if stripped:  # 빈 줄 스킵
                     self.offsets.append(off)
-                off += len(line) + 1  # +1 for newline
+                off += len(raw_line)  # 원본 길이(개행 포함)로 offset 진행
         self.length = len(self.offsets)
 
     def __len__(self):
@@ -322,10 +343,13 @@ class COCOReconstructionDataset(Dataset):
         # ── vision_token_indices 구성 ─────────────────────────────
         tokens_per_image = self.data_args.vision_tower_aux_token_len_list[0]
         T       = self.data_args.max_images_per_sample * tokens_per_image
-        PAD_VAL = T + 1
+        L_text  = tokens_per_image
+        PAD_VAL = L_text + T + 1
         vti = torch.full((T,), PAD_VAL, dtype=torch.long)
-        vti[:tokens_per_image] = torch.arange(tokens_per_image, dtype=torch.long)
-        vision_token_indices = vti.sort()[1]
+        vti[:tokens_per_image] = torch.arange(
+            L_text, L_text + tokens_per_image, dtype=torch.long
+        )
+        vision_token_indices = vti
 
         # ── input_ids: 이미지 토큰만으로 구성 ────────────────────
         # Text 없음 → IMAGE_TOKEN_INDEX × tokens_per_image
@@ -489,8 +513,90 @@ class LengthGroupedSampler(Sampler):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Callback
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ScaleRAECallback(TrainerCallback):
+    """학습 시작 시 모델 아키텍처 요약을 출력합니다."""
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if model is None:
+            return
+
+        print("\n" + "=" * 80)
+        print("Scale-RAE Object-Centric Slot Generation Training")
+        print("=" * 80)
+
+        # 파라미터 표 출력
+        if HAS_TABULATE:
+            stat = [
+                [i, n, tuple(p.shape), str(p.dtype), p.requires_grad]
+                for i, (n, p) in enumerate(model.named_parameters())
+                if p.requires_grad
+            ]
+            print("\n[Trainable Parameters]")
+            print(tabulate(
+                stat[:50], headers=["idx", "name", "shape", "dtype", "trainable"]
+            ))
+            if len(stat) > 50:
+                print(f"  ... and {len(stat)-50} more trainable parameters")
+
+        print("\n[Architecture]")
+        print("  source_image → SigLIP2(Frozen) → mm_projector(Frozen)")
+        print("  → [IMG tokens + latent_queries + slot_tokens] → Qwen2 backbone")
+        print("  → SlotEOSDetector → ObjectTokenAggregator → DiT(adaLN trainable)")
+        print("  → pred_features[B,256,1152] → (MultimodalDecoder) → image")
+        print()
+
+        component_map = [
+            ("get_model().embed_tokens",         "Token Embeddings"),
+            ("get_model().mm_projector",         "mm_projector"),
+            ("get_model().vision_tower_aux_list","SigLIP2 Vision Tower"),
+            ("slot_token_emb",                   "Slot Token Embedding"),
+            ("slot_eos_detector",                "SlotEOS Detector"),
+            ("slot_aggregator",                  "ObjectToken Aggregator"),
+            ("diff_head",                        "DiT Diffusion Head"),
+        ]
+        for attr_chain, label in component_map:
+            try:
+                obj = model
+                for attr in attr_chain.split("."):
+                    obj = getattr(obj, attr)
+                if obj is None:
+                    print(f"  {label}: REMOVED/None")
+                    continue
+                if isinstance(obj, (list, nn.ModuleList)):
+                    obj = obj[0] if len(obj) > 0 else None
+                if obj is None:
+                    continue
+                params = list(obj.parameters())
+                if not params:
+                    print(f"  {label}: no parameters")
+                    continue
+                n_total     = sum(p.numel() for p in params) / 1e6
+                n_trainable = sum(p.numel() for p in params if p.requires_grad) / 1e6
+                status = "TRAINABLE" if n_trainable > 0 else "FROZEN"
+                print(f"  {label}: {n_total:.1f}M params, {status}"
+                      + (f" ({n_trainable:.2f}M trainable)" if n_trainable > 0 and n_trainable < n_total else ""))
+            except AttributeError:
+                pass
+
+        total_p    = sum(p.numel() for p in model.parameters()) / 1e6
+        trainable  = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+        print(f"\n  [Total] {total_p:.1f}M params, {trainable:.2f}M trainable ({trainable/total_p*100:.1f}%)")
+        print("=" * 80 + "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ─────────────────────────────────────────────────────────────────────────────
+
+_DECODER_CONFIG_PATH = "/home/jovyan/Object-QueryLM-SigLIP/checkpoints/decoder/config.json"
+_DECODER_WEIGHT_PATH = "/home/jovyan/Object-QueryLM-SigLIP/checkpoints/decoder/model.pt"
+_SIGLIP_ENCODER_NAME = "google/siglip2-so400m-patch14-224"
+
 
 class ScaleRAETrainer(Trainer):
     """
@@ -500,6 +606,38 @@ class ScaleRAETrainer(Trainer):
       - n_objects를 batch에서 꺼내 model.forward에 전달
       - gt_image_features는 model 내부에서 자동 생성 (_oc_gt_cache 경유)
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._custom_losses: Dict[str, List[float]] = {}
+        self._last_grad_norm: Optional[float] = None
+        self._image_decoder = None
+        self._load_image_decoder()
+
+    def _load_image_decoder(self):
+        """MultimodalDecoder 로드 (eval 이미지 시각화용)."""
+        if not (os.path.exists(_DECODER_CONFIG_PATH) and os.path.exists(_DECODER_WEIGHT_PATH)):
+            logger_module.warning(
+                "[ScaleRAETrainer] Decoder weights not found. "
+                "Image visualization during eval will be disabled."
+            )
+            return
+        try:
+            from scale_rae.model.multimodal_decoder import MultimodalDecoder
+            decoder = MultimodalDecoder(
+                pretrained_encoder_path=_SIGLIP_ENCODER_NAME,
+                general_decoder_config=_DECODER_CONFIG_PATH,
+                num_patches=256,
+                drop_cls_token=True,
+                decoder_path=_DECODER_WEIGHT_PATH,
+            )
+            decoder.eval()
+            for p in decoder.parameters():
+                p.requires_grad_(False)
+            self._image_decoder = decoder
+            logger_module.info("[ScaleRAETrainer] MultimodalDecoder loaded for eval visualization.")
+        except Exception as e:
+            logger_module.warning(f"[ScaleRAETrainer] Failed to load decoder: {e}")
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
@@ -527,6 +665,19 @@ class ScaleRAETrainer(Trainer):
             loss = loss.mean()
 
         self.accelerator.backward(loss)
+
+        # grad_norm 캡처 (clip 이전)
+        if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+            try:
+                params = [p for p in model.parameters() if p.grad is not None]
+                if params:
+                    total_norm = torch.norm(
+                        torch.stack([p.grad.detach().norm(2) for p in params]), 2
+                    ).item()
+                    self._last_grad_norm = total_norm
+            except Exception:
+                pass
+
         return loss.detach() / self.args.gradient_accumulation_steps
 
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -538,16 +689,125 @@ class ScaleRAETrainer(Trainer):
         """
         n_objects = inputs.pop("n_objects", None)
 
-        # gt_image_features는 model.forward 내부에서 자동 처리
-        # (prepare_inputs_labels_for_multimodal → _oc_gt_cache)
         outputs = model(
             **inputs,
             n_objects=n_objects,
-            gt_image_features=None,  # 내부에서 _oc_gt_cache로 처리
+            gt_image_features=None,
         )
 
         loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+
+        # 개별 loss 값 누적 (logging_steps 창 평균용)
+        if model.training:
+            inner = model.module if hasattr(model, 'module') else model
+            for key, attr in [
+                ("loss_fm",       "loss_image_diff"),
+                ("loss_eos",      "oc_eos_loss"),
+                ("loss_div",      "oc_div_loss"),
+                ("loss_language", "loss_language"),
+            ]:
+                val = getattr(inner, attr, None)
+                if val is not None:
+                    try:
+                        self._custom_losses.setdefault(key, []).append(val.item())
+                    except Exception:
+                        pass
+
         return (loss, outputs) if return_outputs else loss
+
+    def log_images(self, logs: Dict[str, Any]) -> None:
+        """wandb Image 딕셔너리를 on_log 콜백으로 전달."""
+        logs["step"] = self.state.global_step
+        self.control = self.callback_handler.on_log(
+            self.args, self.state, self.control, logs
+        )
+
+    def _feat_to_pil(self, feats: torch.Tensor) -> List[PIL.Image.Image]:
+        """SigLIP 피처 (B, 256, 1152) → PIL 이미지 리스트."""
+        if self._image_decoder is None:
+            return []
+        try:
+            device = feats.device
+            dtype  = feats.dtype
+            dec = self._image_decoder.to(device=device, dtype=dtype)
+            B, N, C = feats.shape
+            # prepend dummy CLS token
+            cls_tok = torch.zeros(B, 1, C, device=device, dtype=dtype)
+            dec_input = torch.cat([cls_tok, feats], dim=1)  # (B, 257, 1152)
+            with torch.no_grad():
+                imgs = dec(dec_input).clamp(0, 1)  # (B, 3, H, W)
+            arr = imgs.cpu().float().permute(0, 2, 3, 1).numpy()
+            return [PIL.Image.fromarray((arr[i] * 255).astype(np.uint8)) for i in range(B)]
+        except Exception as e:
+            logger_module.warning(f"[eval] decoder failed: {e}")
+            return []
+
+    def _tensor_to_pil(self, imgs: torch.Tensor) -> List[PIL.Image.Image]:
+        """SigLIP-정규화 이미지 텐서 (B, 3, H, W) → 원본 PIL 이미지 리스트."""
+        # SigLIP2 mean/std (IMAGENET-like: 0.5/0.5)
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
+                            device=imgs.device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711],
+                            device=imgs.device).view(1, 3, 1, 1)
+        imgs = (imgs * std + mean).clamp(0, 1)
+        arr  = imgs.cpu().float().permute(0, 2, 3, 1).numpy()
+        return [PIL.Image.fromarray((arr[i] * 255).astype(np.uint8)) for i in range(len(arr))]
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Eval 스텝: 손실 계산 + Source/GT/Pred 이미지 W&B 로깅."""
+        if inputs is None:
+            return (None, None, None)
+
+        inputs = self._prepare_inputs(inputs)
+        inner  = model.module if hasattr(model, 'module') else model
+
+        with torch.no_grad():
+            # 1. eval loss 계산 (동시에 _oc_gt_cache 채워짐)
+            inputs_copy = dict(inputs)
+            loss = self.compute_loss(model, inputs_copy)
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss = loss.mean()
+
+        if prediction_loss_only or not self.is_world_process_zero():
+            return (loss, None, None)
+
+        # 2. 시각화 (최대 4장)
+        imgs = []
+        try:
+            source = inputs.get("images")  # (B, 3, H, W) SigLIP normalized
+            gt_feats = getattr(inner, "_oc_gt_cache", None)
+
+            # 예측 피처 생성
+            pred_feats = None
+            if hasattr(inner, "is_object_centric") and inner.is_object_centric():
+                gen_result = inner.generate(
+                    inputs=inputs.get("input_ids"),
+                    images=inputs.get("images"),
+                    use_customize_greedy=True,
+                )
+                pred_feats = gen_result.get("pred_image")
+
+            n_show = min(4, source.shape[0] if source is not None else 0)
+
+            src_pil  = self._tensor_to_pil(source[:n_show])  if source     is not None else []
+            gt_pil   = self._feat_to_pil(gt_feats[:n_show])  if gt_feats   is not None else []
+            pred_pil = self._feat_to_pil(pred_feats[:n_show]) if pred_feats is not None else []
+
+            for i in range(n_show):
+                if i < len(src_pil):
+                    imgs.append(wandb.Image(src_pil[i],  caption=f"{i} Source"))
+                if i < len(gt_pil):
+                    imgs.append(wandb.Image(gt_pil[i],   caption=f"{i} GT (SigLIP→Decoder)"))
+                if i < len(pred_pil):
+                    imgs.append(wandb.Image(pred_pil[i], caption=f"{i} Pred (DiT)"))
+        except Exception as e:
+            logger_module.warning(f"[eval] image generation failed: {e}")
+
+        if imgs and HAS_WANDB:
+            self.log_images({"eval_samples": imgs})
+
+        gc.collect()
+        return (loss, None, None)
 
     def create_optimizer(self):
         opt_model = self.model
@@ -640,15 +900,22 @@ class ScaleRAETrainer(Trainer):
             )
             logs["learning_rate"] = self._get_learning_rate()
 
-            # OC 전용 손실 로깅
-            if hasattr(model, 'loss_image_diff') and model.loss_image_diff is not None:
-                logs["loss_fm"]  = round(model.loss_image_diff.item(), 4)
-            if hasattr(model, 'oc_eos_loss') and model.oc_eos_loss is not None:
-                logs["loss_eos"] = round(model.oc_eos_loss.item(), 4)
-            if hasattr(model, 'oc_div_loss') and model.oc_div_loss is not None:
-                logs["loss_div"] = round(model.oc_div_loss.item(), 4)
-            if hasattr(model, 'loss_language') and model.loss_language is not None:
-                logs["loss_language"] = round(model.loss_language.item(), 4)
+            # logging_steps 창 평균 누적 손실 로깅
+            if self._custom_losses:
+                for k, vl in self._custom_losses.items():
+                    if vl:
+                        local_avg = torch.tensor(
+                            sum(vl) / len(vl), device=self.args.device
+                        )
+                        logs[k] = round(
+                            self._nested_gather(local_avg).mean().item(), 4
+                        )
+                self._custom_losses = {}
+
+            # grad_norm
+            if self._last_grad_norm is not None:
+                logs["grad_norm"] = round(self._last_grad_norm, 4)
+                self._last_grad_norm = None
 
             tr_loss -= tr_loss
             self._total_loss_scalar += tr_loss_scalar
@@ -693,9 +960,13 @@ def make_supervised_data_module(
         tokens_per_image=tpi,
     )
 
+    # Eval 데이터셋: 훈련 데이터의 처음 100장을 서브셋으로 사용
+    eval_size = min(100, len(train_dataset))
+    eval_dataset = torch.utils.data.Subset(train_dataset, list(range(eval_size)))
+
     return dict(
         train_dataset=train_dataset,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
     )
 
@@ -751,6 +1022,7 @@ def train(attn_implementation=None):
         model_args.model_name_or_path,
         config=config,
         torch_dtype=compute_dtype,
+        ignore_mismatched_sizes=True,
     )
     model.config.use_cache = False
 
@@ -772,6 +1044,7 @@ def train(attn_implementation=None):
     if model_args.vision_tower_aux_list is not None:
         model_args.vision_tower_aux_list           = json.loads(model_args.vision_tower_aux_list)
         model_args.vision_tower_aux_token_len_list = json.loads(model_args.vision_tower_aux_token_len_list)
+        # unfreeze_mm_vision_tower는 TrainingArguments에만 정의, model_args에 미러링
         model_args.unfreeze_mm_vision_tower        = training_args.unfreeze_mm_vision_tower
 
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
@@ -796,8 +1069,7 @@ def train(attn_implementation=None):
         model.config.use_object_centric              = model_args.use_object_centric
         model.config.oc_max_slots                    = model_args.oc_max_slots
 
-    # ── COCO annotation 경로 전달 ─────────────────────────────────
-    data_args.coco_annotation_path = getattr(model_args, 'coco_annotation_path', None)
+    # ── COCO annotation 경로: DataArguments에서 직접 읽음 ─────────
 
     # ── Freeze / Trainable 설정 ───────────────────────────────────
     if model_args.freeze_backbone:
@@ -806,11 +1078,16 @@ def train(attn_implementation=None):
     if model_args.tune_adapter_and_vision_head:
         model.requires_grad_(False)
         tune_keywords = [
-            'mm_projector', 'vision_head', 'diff_head', 'latent_queries',
+            'vision_head', 'latent_queries',
             'slot_token_emb', 'slot_eos_detector', 'slot_aggregator', 'null_slot_token',
+            'diff_head_projector',
         ]
         for name, param in model.named_parameters():
             if any(kw in name for kw in tune_keywords):
+                param.requires_grad = True
+
+        for name, param in model.named_parameters():
+            if 'diff_head' in name and 'adaLN_modulation' in name:
                 param.requires_grad = True
 
     if model_args.tune_mm_mlp_adapter:
@@ -848,6 +1125,7 @@ def train(attn_implementation=None):
         model=model,
         tokenizer=tokenizer,
         args=training_args,
+        callbacks=[ScaleRAECallback()],
         **data_module,
     )
 

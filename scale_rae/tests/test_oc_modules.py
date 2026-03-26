@@ -134,19 +134,21 @@ def test_build_oc_attention_mask():
     # 5. slot → query: 모두 0
     assert (mask[n_img+n_query:, n_img:n_img+n_query] == 0.0).all(), "slot→query 오류"
 
-    # 6. slot → slot: causal (자기 자신 포함 이전만 0, 이후는 -inf)
+    # 6. slot → slot: causal (자기 자신 포함, LLM 표준 causal과 동일)
     s = n_img + n_query
-    # slot_0는 아무 slot도 볼 수 없음 (자기 자신도 -inf)
-    assert mask[s, s] == float('-inf'),   "slot_0 자기 자신 attend 오류"
+    # slot_0는 자기 자신만 볼 수 있음
+    assert mask[s, s] == 0.0,             "slot_0 자기 자신 attend 오류"
+    assert mask[s, s+1] == float('-inf'), "slot_0 → slot_1 차단 오류"
 
-    # slot_1은 slot_0만 볼 수 있음
+    # slot_1은 slot_0, 자기 자신(slot_1)을 볼 수 있음
     assert mask[s+1, s]   == 0.0,        "slot_1 → slot_0 오류"
-    assert mask[s+1, s+1] == float('-inf'), "slot_1 자기 자신 attend 오류"
+    assert mask[s+1, s+1] == 0.0,        "slot_1 자기 자신 attend 오류"
+    assert mask[s+1, s+2] == float('-inf'), "slot_1 → slot_2 차단 오류"
 
-    # slot_2는 slot_0, slot_1만 볼 수 있음
+    # slot_2는 slot_0, slot_1, 자기 자신(slot_2)을 볼 수 있음
     assert mask[s+2, s]   == 0.0,        "slot_2 → slot_0 오류"
     assert mask[s+2, s+1] == 0.0,        "slot_2 → slot_1 오류"
-    assert mask[s+2, s+2] == float('-inf'), "slot_2 자기 자신 attend 오류"
+    assert mask[s+2, s+2] == 0.0,        "slot_2 자기 자신 attend 오류"
 
     print("✅ build_oc_attention_mask 통과")
 

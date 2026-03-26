@@ -208,13 +208,10 @@ def build_oc_attention_mask(
     # ── slot_i → query 전체 attend ─────────────────────────────────
     mask[n_img + n_query:, n_img:n_img + n_query] = 0.0
 
-    # ── slot → slot : strictly causal ──────────────────────────────
-    # slot_i는 slot_0 .. slot_{i-1}만 attend (자기 자신 제외)
+    # ── slot → slot : causal (자기 자신 포함) ──────────────────────
+    # slot_i는 slot_0 .. slot_i까지 attend (LLM 표준 causal과 동일)
     slot_start = n_img + n_query
     for i in range(n_slots):
-        if i > 0:
-            # slot_i → slot_0 .. slot_{i-1}
-            mask[slot_start + i, slot_start: slot_start + i] = 0.0
-        # slot_i는 자기 자신(slot_i)과 slot_{i+1..}을 attend 못함 → 이미 -inf
+        mask[slot_start + i, slot_start: slot_start + i + 1] = 0.0
 
     return mask   # (L, L)

@@ -115,6 +115,7 @@ class ScaleRAEQwenModel(ScaleRAEMetaModel, Qwen2Model):
         vision_tower_aux_attention_masks_list: Optional[List[torch.Tensor]] = None,
         final_vision_feature_size:             Optional[List[tuple]] = None,
         global_context_feature:               Optional[torch.Tensor] = None,
+        attention_bias:                        Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
 
         output_attentions    = output_attentions    if output_attentions    is not None else self.config.output_attentions
@@ -154,7 +155,9 @@ class ScaleRAEQwenModel(ScaleRAEMetaModel, Qwen2Model):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if self._attn_implementation == "flash_attention_2":
+        if attention_bias is not None:
+            attention_mask = attention_bias
+        elif self._attn_implementation == "flash_attention_2":
             attention_mask = (
                 attention_mask
                 if (attention_mask is not None and 0 in attention_mask)
@@ -312,7 +315,14 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
     # ─── OC 초기화 ───────────────────────────────────────────────
 
     def _init_object_centric_modules(self, config: ScaleRAEQwenConfig) -> None:
-        from .object_centric.slot_generator import SlotEOSDetector, ObjectTokenAggregator
+        from ..object_centric.slot_generator import SlotEOSDetector, ObjectTokenAggregator
+
+        vision_loss_mode = getattr(config, 'vision_loss_mode', 'query')
+        if vision_loss_mode not in ('query', 'half-query', 'query-block'):
+            raise ValueError(
+                f"[OC] Object-Centric 모드는 query vision_loss_mode가 필요합니다. "
+                f"현재: '{vision_loss_mode}'"
+            )
 
         oc_d_model   = getattr(config, 'oc_d_model',   config.hidden_size)
         oc_max_slots = getattr(config, 'oc_max_slots', 10)
@@ -347,17 +357,20 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
         """
         [이슈 4 수정]
         OC 시퀀스에서 각 영역의 offset을 반환.
-        images_per_batch를 고려해서 계산.
+        images_per_batch와 vision_loss_mode를 고려해서 계산.
 
         Returns:
             (n_img, n_query, n_slots)
             - n_img:   이미지 패치 토큰 수 (= num_image_tokens * images_per_batch)
-            - n_query: latent query 토큰 수 (= num_image_tokens * images_per_batch)
+            - n_query: latent query 토큰 수 (query mode일 때만 > 0)
             - n_slots: max slot 수
         """
         images_per_batch = getattr(self, '_oc_images_per_batch', 1)
         n_img   = self.num_image_tokens * images_per_batch
-        n_query = self.num_image_tokens * images_per_batch
+
+        use_query_mode = self.vision_loss_mode in ('query', 'half-query', 'query-block')
+        n_query = self.num_image_tokens * images_per_batch if use_query_mode else 0
+
         n_slots = self.oc_max_slots
         return n_img, n_query, n_slots
 
@@ -366,8 +379,28 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
         if pretrain_path is None:
             return
         logger.info(f"[VisionHead] {pretrain_path} 에서 가중치 로드")
-        weights       = torch.load(pretrain_path, map_location='cpu')
-        model_weights = weights.get('model', weights)
+        if os.path.isdir(pretrain_path):
+            # safetensors 디렉토리 (HuggingFace 체크포인트) → from_pretrained가 이미 로드함
+            import json as _json
+            index_path  = os.path.join(pretrain_path, 'model.safetensors.index.json')
+            single_path = os.path.join(pretrain_path, 'model.safetensors')
+            if os.path.isfile(index_path):
+                from safetensors.torch import load_file as _st_load
+                with open(index_path) as f:
+                    index = _json.load(f)
+                shard_files = sorted(set(index['weight_map'].values()))
+                model_weights = {}
+                for shard in shard_files:
+                    model_weights.update(_st_load(os.path.join(pretrain_path, shard), device='cpu'))
+            elif os.path.isfile(single_path):
+                from safetensors.torch import load_file as _st_load
+                model_weights = _st_load(single_path, device='cpu')
+            else:
+                logger.warning(f"[VisionHead] 디렉토리에서 가중치를 찾을 수 없음: {pretrain_path}")
+                return
+        else:
+            weights       = torch.load(pretrain_path, map_location='cpu')
+            model_weights = weights.get('model', weights)
 
         def get_w(w, key):
             return {k.split(key + '.')[1]: v for k, v in w.items() if key + '.' in k}
@@ -410,23 +443,31 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
         else:
             fm_loss = fm_loss_vec.mean() if fm_loss_vec.dim() > 0 else fm_loss_vec
 
-        # 2. EOS Loss
+        # 2. EOS Loss — k번째 이후 슬롯은 모두 EOS
         eos_gt = torch.zeros(B, max_slots, device=device)
         for b in range(B):
-            k = min(int(K_gt[b].item()), max_slots - 1)
-            eos_gt[b, k] = 1.0
+            k = min(int(K_gt[b].item()), max_slots)
+            eos_gt[b, k:] = 1.0
 
         eos_loss = F.binary_cross_entropy_with_logits(
             eos_sim * 5.0, eos_gt, reduction='mean'
         )
 
-        # 3. Slot Diversity Loss
+        # 3. Slot Diversity Loss — 유효 slot 쌍만 계산
         slots_norm = F.normalize(valid_slots, dim=-1)
         sim_matrix = torch.bmm(slots_norm, slots_norm.transpose(1, 2))
         eye        = torch.eye(max_slots, device=device).unsqueeze(0)
-        off_diag   = sim_matrix * (1.0 - eye)
-        n_pairs    = max_slots * (max_slots - 1)
-        div_loss   = off_diag.sum() / (B * n_pairs + 1e-8)
+
+        valid_flag = torch.zeros(B, max_slots, device=device, dtype=torch.bool)
+        for b in range(B):
+            k = min(int(K_gt[b].item()), max_slots)
+            valid_flag[b, :k] = True
+        pair_valid = valid_flag.unsqueeze(2) & valid_flag.unsqueeze(1)
+        pair_valid = pair_valid & ~eye.bool()
+
+        off_diag   = sim_matrix * pair_valid.float()
+        n_valid    = pair_valid.sum().clamp(min=1e-8)
+        div_loss   = off_diag.sum() / n_valid
 
         total_loss = 1.0 * fm_loss + 0.1 * eos_loss + 0.05 * div_loss
 
@@ -495,6 +536,7 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            attention_bias=attention_bias,
         )
 
         hidden_states = outputs[0]
@@ -589,6 +631,24 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
 
         # ── OC 손실 ──────────────────────────────────────────────
         if gt_image_features is not None and n_objects is not None:
+            # 첫 forward에서 텐서 통계 출력 (디버그)
+            if not getattr(self, '_oc_debug_logged', False):
+                self._oc_debug_logged = True
+                logger.info(
+                    f"[OC DEBUG] gt_image_features: shape={gt_image_features.shape}, "
+                    f"mean={gt_image_features.mean():.4f}, std={gt_image_features.std():.4f}, "
+                    f"absmax={gt_image_features.abs().max():.4f}"
+                )
+                logger.info(
+                    f"[OC DEBUG] context: shape={context.shape}, "
+                    f"mean={context.mean():.4f}, std={context.std():.4f}"
+                )
+                logger.info(
+                    f"[OC DEBUG] eos_sim: shape={eos_sim.shape}, "
+                    f"mean={eos_sim.mean():.4f}, std={eos_sim.std():.4f}"
+                )
+                logger.info(f"[OC DEBUG] n_objects: {n_objects.tolist()}")
+
             oc_losses = self.compute_oc_loss(
                 context=context,
                 gt_image_features=gt_image_features,
@@ -752,25 +812,23 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
         self,
         inputs_embeds:  torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        attention_bias: Optional[torch.Tensor] = None,
         position_ids:   Optional[torch.LongTensor] = None,
         guidance_level: float = 1.0,
         return_slots:   bool  = False,
     ) -> dict:
+        """
+        OC 추론. inputs_embeds에는 prepare_inputs_labels_for_multimodal에서
+        이미 slot 토큰이 삽입되어 있으므로 여기서 다시 추가하지 않는다.
+        """
 
         B = inputs_embeds.shape[0]
-        _, n_query, n_slots = self._get_oc_offsets()
-        n_img = self.num_image_tokens * getattr(self, '_oc_images_per_batch', 1)
-
-        slot_tokens = self.slot_token_emb.expand(B, n_slots, -1)
-        inputs_embeds_oc = torch.cat([inputs_embeds, slot_tokens], dim=1)
-
-        if attention_mask is not None:
-            slot_attn      = torch.ones(B, n_slots, device=inputs_embeds.device)
-            attention_mask = torch.cat([attention_mask, slot_attn], dim=1)
+        n_img, n_query, n_slots = self._get_oc_offsets()
 
         outputs       = self.model(
-            inputs_embeds=inputs_embeds_oc,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            attention_bias=attention_bias,
             position_ids=position_ids,
             return_dict=True,
         )
@@ -819,11 +877,12 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
         attention_mask = kwargs.pop("attention_mask", None)
         kwargs.pop("extra_mm", None)
 
+        attention_bias = None
         if images is not None or image_embeds is not None:
             (
                 input_ids, position_ids, attention_mask,
                 past_key_values, inputs_embeds, labels,
-                _, _, _, _,
+                _, _, attention_bias, _,
             ) = self.prepare_inputs_labels_for_multimodal(
                 inputs, position_ids, attention_mask, None, None,
                 images=images, image_embeds=image_embeds,
@@ -835,6 +894,7 @@ class ScaleRAEQwenForCausalLM(Qwen2ForCausalLM, ScaleRAEMetaForCausalLM):
             return self.greedy_decode_oc(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                attention_bias=attention_bias,
                 position_ids=position_ids,
                 guidance_level=guidance_level,
                 return_slots=return_scores,

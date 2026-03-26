@@ -4,7 +4,8 @@ import torch.nn.functional as F
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 from open_clip import create_model_from_pretrained, get_tokenizer
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 from .base_encoder import BaseVisionTower
 from scale_rae.utils import IS_XLA_AVAILABLE

@@ -6,7 +6,8 @@ import torch.nn as nn
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 from open_clip import create_model_from_pretrained, get_tokenizer 
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 from scale_rae.utils import IS_XLA_AVAILABLE
 
 

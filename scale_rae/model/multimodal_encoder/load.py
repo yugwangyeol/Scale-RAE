@@ -1,4 +1,5 @@
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 from .clip_encoder import ClipVisionTower
 from .dfn_clip_encoder import DfnClipVisionTower

@@ -6,7 +6,8 @@ from diffusers.image_processor import VaeImageProcessor
 from .base_encoder import BaseVisionTower
 from scale_rae.utils import IS_XLA_AVAILABLE
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 def parse_vae_model_name(model_name):
     """

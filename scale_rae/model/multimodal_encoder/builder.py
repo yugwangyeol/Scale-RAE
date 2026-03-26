@@ -1,7 +1,8 @@
 import os
 import copy
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 from .siglip_encoder import SiglipVisionTower
 from .dino_encoder import DinoVisionTower

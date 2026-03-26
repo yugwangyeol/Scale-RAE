@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 
 from transformers import Dinov2Model, AutoImageProcessor, Dinov2Config
 

@@ -28,7 +28,8 @@ from transformers.trainer import (
     is_torch_tpu_available
 )
 
-from ezcolorlog import root_logger as logger
+import logging
+logger = logging.getLogger(__name__)
 from scale_rae.utils import IS_XLA_AVAILABLE
 
 from packaging import version
